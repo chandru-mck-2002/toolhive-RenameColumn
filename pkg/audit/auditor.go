@@ -3,7 +3,6 @@ package audit
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -21,30 +20,6 @@ import (
 
 // LevelAudit is a custom audit log level - between Info and Warn
 const LevelAudit = slog.Level(2)
-
-// contextKey is an unexported type for context keys to avoid collisions
-type contextKey struct{}
-
-// backendInfoKey is the context key for storing backend routing information
-var backendInfoKey = contextKey{}
-
-// BackendInfo stores backend routing information that can be mutated by handlers.
-// This allows handlers deep in the call stack to provide backend info to the audit middleware.
-type BackendInfo struct {
-	BackendName string
-}
-
-// WithBackendInfo returns a new context with BackendInfo attached.
-func WithBackendInfo(ctx context.Context, info *BackendInfo) context.Context {
-	return context.WithValue(ctx, backendInfoKey, info)
-}
-
-// BackendInfoFromContext retrieves BackendInfo from the context.
-// Returns (nil, false) if BackendInfo is not found in the context.
-func BackendInfoFromContext(ctx context.Context) (*BackendInfo, bool) {
-	info, ok := ctx.Value(backendInfoKey).(*BackendInfo)
-	return info, ok
-}
 
 // NewAuditLogger creates a new structured audit logger that writes to the specified writer.
 func NewAuditLogger(w io.Writer) *slog.Logger {
@@ -64,11 +39,13 @@ type Auditor struct {
 	config        *Config
 	auditLogger   *slog.Logger
 	transportType string // e.g., "sse", "streamable-http"
+	logFile       *os.File
 }
 
 // NewAuditorWithTransport creates a new Auditor with the given configuration and transport information.
 func NewAuditorWithTransport(config *Config, transportType string) (*Auditor, error) {
 	var logWriter io.Writer = os.Stdout // default to stdout
+	var logFile *os.File
 
 	if config != nil {
 		w, err := config.GetLogWriter()
@@ -78,12 +55,17 @@ func NewAuditorWithTransport(config *Config, transportType string) (*Auditor, er
 			return nil, err
 		}
 		logWriter = w
+		// Store file handle if it's a file (not stdout)
+		if file, ok := w.(*os.File); ok && file != os.Stdout {
+			logFile = file
+		}
 	}
 
 	return &Auditor{
 		config:        config,
 		auditLogger:   NewAuditLogger(logWriter),
 		transportType: transportType,
+		logFile:       logFile,
 	}, nil
 }
 
@@ -154,14 +136,6 @@ func (a *Auditor) Middleware(next http.Handler) http.Handler {
 
 		startTime := time.Now()
 
-		// Add BackendInfo to context if not already present
-		// (backend enrichment middleware may have already added it)
-		if _, ok := BackendInfoFromContext(r.Context()); !ok {
-			backendInfo := &BackendInfo{}
-			ctx := WithBackendInfo(r.Context(), backendInfo)
-			r = r.WithContext(ctx)
-		}
-
 		// Capture request data if configured
 		var requestData []byte
 		if a.config.IncludeRequestData && r.Body != nil {
@@ -227,7 +201,7 @@ func (a *Auditor) logAuditEvent(r *http.Request, rw *responseWriter, requestData
 	}
 
 	// Add metadata
-	a.addMetadata(event, r, duration, rw)
+	a.addMetadata(event, duration, rw)
 
 	// Add request/response data if configured
 	a.addEventData(event, r, rw, requestData)
@@ -431,7 +405,7 @@ func (*Auditor) extractTarget(r *http.Request, eventType string) map[string]stri
 }
 
 // addMetadata adds metadata to the audit event.
-func (a *Auditor) addMetadata(event *AuditEvent, r *http.Request, duration time.Duration, rw *responseWriter) {
+func (a *Auditor) addMetadata(event *AuditEvent, duration time.Duration, rw *responseWriter) {
 	if event.Metadata.Extra == nil {
 		event.Metadata.Extra = make(map[string]any)
 	}
@@ -449,12 +423,6 @@ func (a *Auditor) addMetadata(event *AuditEvent, r *http.Request, duration time.
 	// Add response size if available
 	if rw.body != nil {
 		event.Metadata.Extra[MetadataExtraKeyResponseSize] = rw.body.Len()
-	}
-
-	// Add backend routing information from context if available
-	// Backend info is populated by the backend enrichment middleware
-	if backendInfo, ok := BackendInfoFromContext(r.Context()); ok && backendInfo != nil && backendInfo.BackendName != "" {
-		event.Metadata.Extra["backend_name"] = backendInfo.BackendName
 	}
 }
 
@@ -525,4 +493,12 @@ func (a *Auditor) logSSEConnectionEvent(r *http.Request) {
 
 	// Log the event
 	event.LogTo(r.Context(), a.auditLogger, LevelAudit)
+}
+
+// Close closes the audit log file if one was opened.
+func (a *Auditor) Close() error {
+	if a.logFile != nil {
+		return a.logFile.Close()
+	}
+	return nil
 }

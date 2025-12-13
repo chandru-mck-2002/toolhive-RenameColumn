@@ -32,7 +32,7 @@ type Config struct {
 }
 
 // GetLogWriter creates and returns the appropriate io.Writer based on the configuration.
-func (c *Config) GetLogWriter() (io.Writer, error) {
+func (c *Config) GetLogWriter() (io.WriteCloser, error) {
 	if c == nil || c.LogFile == "" {
 		return os.Stdout, nil
 	}
@@ -105,6 +105,13 @@ func (c *Config) ShouldAuditEvent(eventType string) bool {
 }
 
 // CreateMiddlewareWithTransport creates an HTTP middleware from the audit configuration with transport information.
+//
+// WARNING: This function creates an Auditor but does not return it, which means the file handle
+// cannot be closed if LogFile is configured. This can lead to file descriptor leaks.
+// For production use, prefer using NewAuditorWithTransport directly and storing the auditor
+// reference so it can be closed during cleanup.
+//
+// This function is primarily intended for convenience in tests or when file logging is not used.
 func (c *Config) CreateMiddlewareWithTransport(transportType string) (types.MiddlewareFunction, error) {
 	auditor, err := NewAuditorWithTransport(c, transportType)
 	if err != nil {
@@ -115,6 +122,10 @@ func (c *Config) CreateMiddlewareWithTransport(transportType string) (types.Midd
 
 // GetMiddlewareFromFile loads the audit configuration from a file and creates an HTTP middleware.
 // Note: This function requires a transport type to be provided separately.
+//
+// WARNING: This function has the same file descriptor leak issue as CreateMiddlewareWithTransport.
+// If LogFile is configured, the file handle will not be closed. This function is primarily
+// intended for testing. For production use, use NewAuditorWithTransport directly.
 func GetMiddlewareFromFile(path string, transportType string) (func(http.Handler) http.Handler, error) {
 	// Load the configuration
 	config, err := LoadFromFile(path)
